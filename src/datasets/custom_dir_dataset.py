@@ -7,7 +7,8 @@ import torch
 import torchaudio
 from torchaudio.datasets import LIBRISPEECH
 
-AUDIO_EXTS = [".flac", ".wav"]
+AUDIO_EXTS = [".flac", ".wav", ".mp3"]
+
 
 
 def _list_audio_files(directory: str) -> List[str]:

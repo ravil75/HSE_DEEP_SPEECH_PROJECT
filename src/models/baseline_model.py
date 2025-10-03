@@ -1,4 +1,4 @@
-# src/models/baseline_mode.py
+# src/models/baseline_model.py
 import torch
 import torch.nn as nn
 import torchaudio

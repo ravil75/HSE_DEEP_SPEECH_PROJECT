@@ -30,25 +30,30 @@ def compute_cer(target_text: str, pred_text: str):
     return dist / len(tgt)
 
 
-def batch_metrics(
-    refs: List[str], hyps: List[str], normalize: bool = True, skip_empty_refs: bool = True
-) -> Tuple[float, float, int]:
-    
+def batch_metrics(refs: List[str], hyps: List[str], normalize: bool = True, skip_empty_refs: bool = True):
     if len(refs) != len(hyps):
         raise ValueError("refs and hyps must have same length")
     sum_wer = 0.0
     sum_cer = 0.0
     count = 0
     for r, h in zip(refs, hyps):
-        r_norm = _normalize_words(r) if normalize else (r or "")
-        h_norm = _normalize_words(h) if normalize else (h or "")
-        if r_norm == "" and skip_empty_refs:
+        if normalize:
+            r_s = " ".join(_normalize_words(r))
+            h_s = " ".join(_normalize_words(h))
+        else:
+            r_s = r or ""
+            h_s = h or ""
+
+        if r_s.strip() == "" and skip_empty_refs:
             continue
-        wer = compute_wer(r_norm, h_norm, normalize=False)
-        cer = compute_cer(r_norm, h_norm, normalize=False)
+
+        wer = compute_wer(r_s, h_s)
+        cer = compute_cer(r_s, h_s)
         sum_wer += wer
         sum_cer += cer
         count += 1
+
     avg_wer = sum_wer / count if count > 0 else 0.0
     avg_cer = sum_cer / count if count > 0 else 0.0
     return avg_wer, avg_cer, count
+

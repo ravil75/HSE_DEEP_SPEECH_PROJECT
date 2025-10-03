@@ -83,6 +83,11 @@ def main():
             print(f"step {step}/{STEPS} loss={loss.item():.6f}")
 
     print("Done. One-batch training finished.")
+    # Сохранение чекпоинта для inference
+    ckpt = {"state_dict": model.state_dict(), "optimizer": optimizer.state_dict()}
+    torch.save(ckpt, "checkpoint.pth")
+    print("[INFO] checkpoint saved to checkpoint.pth")
+
 
 if __name__ == "__main__":
     main()
