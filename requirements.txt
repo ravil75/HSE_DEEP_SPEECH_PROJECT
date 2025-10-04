@@ -13,3 +13,4 @@ black
 isort
 pre-commit
 editdistance
+jiwer
