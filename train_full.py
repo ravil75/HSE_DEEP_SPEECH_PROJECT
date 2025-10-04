@@ -1,4 +1,3 @@
-# train_full.py
 import os
 import math
 import time
@@ -37,7 +36,7 @@ DEFAULTS = {
     "batch_size": 4,
     "epochs": 5,
     "steps_per_epoch": None,
-    "lr": 1e-3,
+    "lr": 3e-4,  # <-- ИЗМЕНЕНИЕ: Снижена скорость обучения по умолчанию для стабильности
     "rnn_hidden_size": 768,
     "num_rnn_layers": 5,
     "grad_clip": 5.0,
@@ -79,39 +78,22 @@ def init_wandb(args, config: Dict[str, Any]):
 
 def build_dataloaders(args, tokenizer):
     """Создаем загрузчики данных для обучения и валидации"""
-    # Тренировочные данные
     train_ds = CustomDirDataset(
-        args.data_root,
-        sample_rate=args.sample_rate,
-        transforms=None,
-        return_tensor=True,
-        use_torchaudio=args.use_torchaudio,
-        librispeech_url=args.libri_subset if args.use_torchaudio else None,
-        download=args.download,
+        args.data_root, sample_rate=args.sample_rate, use_torchaudio=args.use_torchaudio,
+        librispeech_url=args.libri_subset if args.use_torchaudio else None, download=args.download,
     )
     
-    # Валидационные данные
+    val_ds = None
     if args.use_torchaudio:
         val_ds = CustomDirDataset(
-            args.data_root,
-            sample_rate=args.sample_rate,
-            transforms=None,
-            return_tensor=True,
-            use_torchaudio=True,
-            librispeech_url=args.val_subset,
-            download=args.download,
+            args.data_root, sample_rate=args.sample_rate, use_torchaudio=True,
+            librispeech_url=args.val_subset, download=args.download,
         )
     else:
-        # Ищем папку с валидационными данными
         val_root = os.path.join(args.data_root, "val")
-        if not os.path.exists(val_root):
-            val_root = os.path.join(args.data_root, "validation")
         if os.path.isdir(val_root):
-            val_ds = CustomDirDataset(val_root, sample_rate=args.sample_rate, transforms=None, return_tensor=True)
-        else:
-            val_ds = None
+            val_ds = CustomDirDataset(val_root, sample_rate=args.sample_rate)
 
-    # Функция для объединения примеров в батч
     collate = lambda b: collate_fn(b, tokenizer=tokenizer, hop_length=args.hop_length)
     
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, num_workers=args.num_workers)
@@ -123,13 +105,8 @@ def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=N
     model.eval()
     with torch.no_grad():
         inp = batch_inputs.to(device)
-        if sample_lengths is not None:
-            logits = model(inp, sample_lengths=sample_lengths)
-        else:
-            logits = model(inp)
-        # Берем argmax по классам
+        logits = model(inp, sample_lengths=sample_lengths)
         preds = torch.argmax(logits, dim=-1).cpu().tolist()
-        # Декодируем в текст
         decs = [tokenizer.decode(p) for p in preds]
     return decs
 
@@ -140,75 +117,42 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
     pbar = tqdm(loader, desc="train", leave=False)
 
     for batch in pbar:
+        optimizer.zero_grad()
+        
         inputs = batch["inputs"].to(device)
-        sample_lengths = batch["sample_lengths"]
+        sample_lengths = batch["sample_lengths"].to(device)
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
         
-        # ВАЖНО: Добавляем проверку длин
+        # --- ЗАЩИТА УРОВЕНЬ 1: Проверка соответствия длин для CTCLoss ---
         with torch.no_grad():
-            input_lengths = model.get_output_lengths(sample_lengths).to(device)
-            
-            # Проверяем, что все input_lengths >= target_lengths
-            valid_mask = (input_lengths >= target_lengths) & (input_lengths > 0) & (target_lengths > 0)
-            if not valid_mask.all():
-                print(f"Warning: Invalid lengths found. Skipping batch. "
-                      f"input_lengths: {input_lengths}, target_lengths: {target_lengths}")
+            input_lengths = model.get_output_lengths(sample_lengths)
+            if not (input_lengths >= target_lengths).all():
+                # print(f"Warning: Invalid lengths found. Skipping batch. Input: {input_lengths.tolist()}, Target: {target_lengths.tolist()}")
                 continue
         
-        optimizer.zero_grad()
-        
+        # --- Прямой проход и вычисление потерь ---
         try:
-            if scaler is not None:
-                with torch.cuda.amp.autocast():
-                    logits = model(inputs, sample_lengths=sample_lengths)
-                    log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
-                    
-                    # Используем только валидные последовательности
-                    if not valid_mask.all():
-                        valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-                        if len(valid_indices) == 0:
-                            continue
-                            
-                        log_probs = log_probs[:, valid_indices, :]
-                        targets = targets[torch.cat([torch.arange(target_lengths[i].item()) + 
-                                                   torch.sum(target_lengths[:i]) for i in valid_indices])]
-                        input_lengths = input_lengths[valid_indices]
-                        target_lengths = target_lengths[valid_indices]
-                    
-                    loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
+            use_amp = scaler is not None
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                logits = model(inputs, sample_lengths=sample_lengths)
                 
-                # Проверяем loss перед backward
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Skipping batch with invalid loss: {loss.item()}")
+                # --- ЗАЩИТА УРОВЕНЬ 2: Проверка на численную нестабильность в модели ---
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    print("!!! Found NaN/Inf in model logits. Skipping batch due to numerical instability. Consider reducing learning rate. !!!")
                     continue
-                    
+                
+                log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
+                loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
+
+            # --- Обратный проход ---
+            if use_amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                logits = model(inputs, sample_lengths=sample_lengths)
-                log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
-                
-                if not valid_mask.all():
-                    valid_indices = valid_mask.nonzero(as_tuple=True)[0]
-                    if len(valid_indices) == 0:
-                        continue
-                        
-                    log_probs = log_probs[:, valid_indices, :]
-                    targets = targets[torch.cat([torch.arange(target_lengths[i].item()) + 
-                                               torch.sum(target_lengths[:i]) for i in valid_indices])]
-                    input_lengths = input_lengths[valid_indices]
-                    target_lengths = target_lengths[valid_indices]
-                
-                loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
-                
-                if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Skipping batch with invalid loss: {loss.item()}")
-                    continue
-                    
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
@@ -219,7 +163,7 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                 pbar.set_postfix({"loss": f"{total_loss / n_steps:.4f}"})
                 
         except Exception as e:
-            print(f"Error in batch: {e}")
+            print(f"Error processing batch: {e}. Skipping.")
             continue
 
     return total_loss / max(1, n_steps)
@@ -227,140 +171,80 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
 def validate(model, loader, device, tokenizer, args, max_batches: Optional[int] = None):
     """Валидация модели"""
     model.eval()
-    all_refs = []  # эталонные тексты
-    all_hyps = []  # предсказанные тексты
+    all_refs, all_hyps = [], []
     
     with torch.no_grad():
         pbar = tqdm(loader, desc="valid", leave=False)
         for i, batch in enumerate(pbar):
-            inputs = batch["inputs"]
-            sample_lengths = batch["sample_lengths"]
-            
-            # Декодируем батч
-            decs = greedy_decode_batch(model, inputs, device, tokenizer, sample_lengths=sample_lengths)
-            refs = batch.get("texts", None)
-            
-            if refs is None:
-                refs = [""] * len(decs)
-                
-            # Сохраняем результаты
-            for r, h in zip(refs, decs):
-                all_refs.append(r)
-                all_hyps.append(h)
-                
-            if max_batches is not None and i+1 >= max_batches:
+            decs = greedy_decode_batch(model, batch["inputs"], device, tokenizer, sample_lengths=batch["sample_lengths"])
+            refs = batch.get("texts", [""] * len(decs))
+            all_refs.extend(refs)
+            all_hyps.extend(decs)
+            if max_batches is not None and i + 1 >= max_batches:
                 break
                 
-    # Считаем метрики
-    avg_wer, avg_cer, count = batch_metrics(all_refs, all_hyps, normalize=True, skip_empty_refs=True)
+    avg_wer, avg_cer, count = batch_metrics(all_refs, all_hyps)
     return avg_wer, avg_cer, count
 
 def save_checkpoint(state: dict, path: str):
-    """Сохраняем чекпоинт"""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(state, path)
 
 def main():
     """Главная функция обучения"""
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
-    device = torch.device(args.device if args.device != "" else ("cuda" if torch.cuda.is_available() else "cpu"))
+    device = torch.device(args.device)
     print(f"[INFO] Device={device}, data_root={args.data_root}, use_torchaudio={args.use_torchaudio}")
 
-    # Токенизатор и данные
     tokenizer = CharTokenizer()
     train_loader, val_loader = build_dataloaders(args, tokenizer)
-    print(f"[INFO] Train size: {len(train_loader.dataset)}, Val size: {len(val_loader.dataset) if val_loader is not None else 0}")
-
-    # Модель и оптимизатор
+    print(f"[INFO] Train size: {len(train_loader.dataset)}, Val size: {len(val_loader.dataset) if val_loader else 0}")
 
     model = SampleCTCModel(
         num_classes=tokenizer.vocab_size,
         sample_rate=args.sample_rate,
         n_mels=args.n_mels,
-        n_fft= getattr(args, "n_fft", 400),       # если args.n_fft нет, используем 400
         hop_length=args.hop_length,
-        hidden=getattr(args, "rnn_hidden_size", 256)  # map rnn_hidden_size -> hidden
+        hidden=args.rnn_hidden_size
     ).to(device)
-
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, verbose=True)
     ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True)
+    scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
 
-    # Mixed precision для GPU
-    scaler = torch.cuda.amp.GradScaler() if (device.type == "cuda") else None
-
-    # Продолжение обучения если нужно
-    start_epoch = 1
-    best_wer = float("inf")
+    start_epoch, best_wer = 1, float("inf")
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
-        state = ckpt.get("state_dict", ckpt)
-        model.load_state_dict(state)
-        if "optimizer" in ckpt:
-            optimizer.load_state_dict(ckpt["optimizer"])
-        start_epoch = ckpt.get("epoch", 1)
-        best_wer = ckpt.get("best_wer", best_wer)
-        print(f"[INFO] Resumed from {args.resume} epoch={start_epoch} best_wer={best_wer}")
+        model.load_state_dict(ckpt.get("state_dict", ckpt))
+        if "optimizer" in ckpt: optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt.get("epoch", 1) + 1
+        best_wer = ckpt.get("best_wer", float("inf"))
+        print(f"[INFO] Resumed from {args.resume} epoch={start_epoch} best_wer={best_wer:.4f}")
 
-    # Инициализация WandB
-    wandb_run = None
-    config = vars(args)
-    if args.wandb_proj:
-        wandb_run = init_wandb(args, config)
+    wandb_run = init_wandb(args, vars(args)) if args.wandb_proj else None
 
-    # Цикл обучения
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        
-        # Одна эпоха обучения
-        train_loss = run_one_epoch(model, train_loader, optimizer, ctc_loss, device, tokenizer, args, scaler=scaler)
+        train_loss = run_one_epoch(model, train_loader, optimizer, ctc_loss, device, tokenizer, args, scaler)
         epoch_time = time.time() - t0
 
-        # Валидация
-        if val_loader is not None:
-            val_wer, val_cer, val_count = validate(model, val_loader, device, tokenizer, args)
-        else:
-            val_wer, val_cer, val_count = float("nan"), float("nan"), 0
+        val_wer, val_cer = float("nan"), float("nan")
+        if val_loader:
+            val_wer, val_cer, _ = validate(model, val_loader, device, tokenizer, args)
 
-        print(f"[Epoch {epoch}] train_loss={train_loss:.4f} val_wer={val_wer:.4f} val_cer={val_cer:.4f} time={epoch_time:.1f}s")
+        print(f"[Epoch {epoch}/{args.epochs}] train_loss={train_loss:.4f} val_wer={val_wer:.4f} val_cer={val_cer:.4f} time={epoch_time:.1f}s")
+        scheduler.step(val_wer if not math.isnan(val_wer) else train_loss)
 
-        # Обновляем learning rate
-        scheduler.step(train_loss)
-
-        # Логируем в WandB
         if wandb_run:
-            wandb.log({
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_wer": val_wer,
-                "val_cer": val_cer,
-                "time": epoch_time,
-                "lr": optimizer.param_groups[0]["lr"],
-            })
+            wandb.log({"epoch": epoch, "train_loss": train_loss, "val_wer": val_wer, "val_cer": val_cer, "lr": optimizer.param_groups[0]["lr"]})
 
-        # Сохраняем чекпоинт
-        ckpt_path = os.path.join(args.save_dir, f"checkpoint_epoch{epoch}.pth")
-        save_checkpoint({
-            "epoch": epoch,
-            "state_dict": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "train_loss": train_loss,
-            "best_wer": best_wer,
-        }, ckpt_path)
-
-        # Сохраняем лучшую модель
-        if val_wer < best_wer:
+        is_best = val_wer < best_wer
+        if is_best:
             best_wer = val_wer
             best_path = os.path.join(args.save_dir, "best_checkpoint.pth")
-            save_checkpoint({
-                "epoch": epoch,
-                "state_dict": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "train_loss": train_loss,
-                "best_wer": best_wer,
-            }, best_path)
+            save_checkpoint({"epoch": epoch, "state_dict": model.state_dict(), "best_wer": best_wer}, best_path)
             print(f"[INFO] New best model saved to {best_path} (WER={best_wer:.4f})")
 
     print("[INFO] Training finished.")
