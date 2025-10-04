@@ -15,7 +15,7 @@ from tqdm import tqdm
 from src.utils.tokenizer import CharTokenizer
 from src.datasets.custom_dir_dataset import CustomDirDataset
 from src.datasets.collate import collate_fn
-from src.models.baseline_model import SampleCTCModel as DeepSpeech2
+from src.models.baseline_model import SampleCTCModel
 from tools.metrics import batch_metrics, compute_wer, compute_cer
 
 # Для визуализации обучения
@@ -273,14 +273,16 @@ def main():
     print(f"[INFO] Train size: {len(train_loader.dataset)}, Val size: {len(val_loader.dataset) if val_loader is not None else 0}")
 
     # Модель и оптимизатор
-    model = DeepSpeech2(
+
+    model = SampleCTCModel(
         num_classes=tokenizer.vocab_size,
         sample_rate=args.sample_rate,
         n_mels=args.n_mels,
+        n_fft= getattr(args, "n_fft", 400),       # если args.n_fft нет, используем 400
         hop_length=args.hop_length,
-        rnn_hidden_size=args.rnn_hidden_size,
-        num_rnn_layers=args.num_rnn_layers,
+        hidden=getattr(args, "rnn_hidden_size", 256)  # map rnn_hidden_size -> hidden
     ).to(device)
+
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, verbose=True)
