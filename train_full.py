@@ -148,10 +148,8 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
         target_lengths = batch["target_lengths"].to(device)
         
         # Считаем длины входных последовательностей
-        input_lengths = batch.get("input_lengths", None)
-        if input_lengths is None:
-            with torch.no_grad():
-                input_lengths = model.get_output_lengths(sample_lengths).to(device)
+        with torch.no_grad():
+            input_lengths = model.get_output_lengths(sample_lengths).to(device)  
 
         # Обнуляем градиенты
         optimizer.zero_grad()
