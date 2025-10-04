@@ -15,7 +15,7 @@ from tqdm import tqdm
 from src.utils.tokenizer import CharTokenizer
 from src.datasets.custom_dir_dataset import CustomDirDataset
 from src.datasets.collate import collate_fn
-from src.models.deepspeech2_model import DeepSpeech2
+from src.models.baseline_model import SampleCTCModel as DeepSpeech2
 from tools.metrics import batch_metrics, compute_wer, compute_cer
 
 # Для визуализации обучения
@@ -134,53 +134,93 @@ def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=N
     return decs
 
 def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, scaler=None):
-    """Одна эпоха обучения"""
     model.train()
     total_loss = 0.0
     n_steps = 0
     pbar = tqdm(loader, desc="train", leave=False)
-    
+
     for batch in pbar:
-        # Переносим данные на GPU
         inputs = batch["inputs"].to(device)
         sample_lengths = batch["sample_lengths"]
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
         
-        # Считаем длины входных последовательностей
+        # ВАЖНО: Добавляем проверку длин
         with torch.no_grad():
-            input_lengths = model.get_output_lengths(sample_lengths).to(device)  
-
-        # Обнуляем градиенты
+            input_lengths = model.get_output_lengths(sample_lengths).to(device)
+            
+            # Проверяем, что все input_lengths >= target_lengths
+            valid_mask = (input_lengths >= target_lengths) & (input_lengths > 0) & (target_lengths > 0)
+            if not valid_mask.all():
+                print(f"Warning: Invalid lengths found. Skipping batch. "
+                      f"input_lengths: {input_lengths}, target_lengths: {target_lengths}")
+                continue
+        
         optimizer.zero_grad()
         
-        # Прямой проход с mixed precision если есть GPU
-        if scaler is not None:
-            with torch.cuda.amp.autocast():
+        try:
+            if scaler is not None:
+                with torch.cuda.amp.autocast():
+                    logits = model(inputs, sample_lengths=sample_lengths)
+                    log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
+                    
+                    # Используем только валидные последовательности
+                    if not valid_mask.all():
+                        valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+                        if len(valid_indices) == 0:
+                            continue
+                            
+                        log_probs = log_probs[:, valid_indices, :]
+                        targets = targets[torch.cat([torch.arange(target_lengths[i].item()) + 
+                                                   torch.sum(target_lengths[:i]) for i in valid_indices])]
+                        input_lengths = input_lengths[valid_indices]
+                        target_lengths = target_lengths[valid_indices]
+                    
+                    loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
+                
+                # Проверяем loss перед backward
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Skipping batch with invalid loss: {loss.item()}")
+                    continue
+                    
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 logits = model(inputs, sample_lengths=sample_lengths)
                 log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
+                
+                if not valid_mask.all():
+                    valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+                    if len(valid_indices) == 0:
+                        continue
+                        
+                    log_probs = log_probs[:, valid_indices, :]
+                    targets = targets[torch.cat([torch.arange(target_lengths[i].item()) + 
+                                               torch.sum(target_lengths[:i]) for i in valid_indices])]
+                    input_lengths = input_lengths[valid_indices]
+                    target_lengths = target_lengths[valid_indices]
+                
                 loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
-            
-            # Обратный проход
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            # Без mixed precision
-            logits = model(inputs, sample_lengths=sample_lengths)
-            log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
-            loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+                
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Skipping batch with invalid loss: {loss.item()}")
+                    continue
+                    
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
 
-        # Считаем статистику
-        total_loss += loss.item()
-        n_steps += 1
-        if n_steps % 10 == 0:
-            pbar.set_postfix({"loss": f"{total_loss / n_steps:.4f}"})
+            total_loss += loss.item()
+            n_steps += 1
+            if n_steps % 10 == 0:
+                pbar.set_postfix({"loss": f"{total_loss / n_steps:.4f}"})
+                
+        except Exception as e:
+            print(f"Error in batch: {e}")
+            continue
 
     return total_loss / max(1, n_steps)
 
