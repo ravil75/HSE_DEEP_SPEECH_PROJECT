@@ -45,7 +45,7 @@ class SampleCTCModel(nn.Module):
         # project to classes
         self.fc = nn.Linear(self.hidden * 2, self.num_classes)
 
-    def forward(self, waveforms: torch.Tensor):
+    def forward(self, waveforms: torch.Tensor, sample_lengths=None):
         """
         waveforms: [B, C, T] or [B, T]
         returns logits: [B, T_out, C_classes]
