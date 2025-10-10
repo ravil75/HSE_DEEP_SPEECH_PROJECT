@@ -59,8 +59,8 @@ class DeepSpeech2(nn.Module):
                 )
             )
 
-        # Нормализация между слоями RNN
-        self.norms = nn.ModuleList([nn.LayerNorm(self.rnn_hidden_size * 2) for _ in range(self.num_rnn_layers)])
+        # Нормализация между слоями RNN (немного уменьшил eps для стабильности)
+        self.norms = nn.ModuleList([nn.LayerNorm(self.rnn_hidden_size * 2, eps=1e-6) for _ in range(self.num_rnn_layers)])
 
         # Финальный классификатор
         self.fc = nn.Linear(self.rnn_hidden_size * 2, self.num_classes)
@@ -85,7 +85,8 @@ class DeepSpeech2(nn.Module):
 
         # Извлекаем мел-спектрограмму
         x = self.melspec(waveforms)
-        x = self.amptodb(x)
+
+        x = self.amptodb(x.clamp(min=1e-5))
 
         # Применяем свертки
         x = x.unsqueeze(1)
@@ -103,7 +104,7 @@ class DeepSpeech2(nn.Module):
             # Сортируем по убыванию длины для упаковки
             sorted_lens, perm_idx = rnn_lengths.sort(descending=True)
             x_sorted = x[perm_idx]
-            
+
             packed = pack_padded_sequence(x_sorted, sorted_lens.cpu(), batch_first=True, enforce_sorted=True)
 
             # Проходим через все RNN слои
@@ -111,7 +112,9 @@ class DeepSpeech2(nn.Module):
             for i in range(self.num_rnn_layers):
                 packed_out, _ = self.rnns[i](packed_seq)
                 padded, lengths_after = pad_packed_sequence(packed_out, batch_first=True)
+
                 padded = self.norms[i](padded)
+
                 packed_seq = pack_padded_sequence(padded, lengths_after.cpu(), batch_first=True, enforce_sorted=True)
 
             # Распаковываем и возвращаем исходный порядок
@@ -119,31 +122,35 @@ class DeepSpeech2(nn.Module):
             inv_perm = perm_idx.argsort()
             x = padded_final[inv_perm]
         else:
-            # Простой forward без упаковки
             for i in range(self.num_rnn_layers):
                 x, _ = self.rnns[i](x)
                 x = self.norms[i](x)
 
         # Финальный линейный слой
         logits = self.fc(x)
+
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e5, neginf=-1e5)
+     
+
         return logits
 
     def get_output_lengths(self, sample_lengths: torch.Tensor, use_ceil_for_mels: bool = True) -> torch.Tensor:
         """Считаем сколько временных шагов будет после сверток"""
         L = sample_lengths.cpu().long().clone()
-        
+
         # Мел-фреймы
         if use_ceil_for_mels:
             L = torch.ceil(L.float() / float(self.hop_length)).long()
         else:
             L = torch.clamp(((L - self.n_fft) // self.hop_length) + 1, min=0)
 
-        # Формула для сверток
+        # Свертки
         def conv_time_len(L_in, kernel_time, stride_time, pad_time):
             out = (L_in + 2 * pad_time - kernel_time) // stride_time + 1
             return torch.clamp(out, min=0)
 
         L = conv_time_len(L, kernel_time=11, stride_time=2, pad_time=5)
+       
         L = conv_time_len(L, kernel_time=11, stride_time=1, pad_time=5)
 
         return L

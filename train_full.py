@@ -14,7 +14,7 @@ from tqdm import tqdm
 from src.utils.tokenizer import CharTokenizer
 from src.datasets.custom_dir_dataset import CustomDirDataset
 from src.datasets.collate import collate_fn
-from src.models.baseline_model import SampleCTCModel
+from src.models.deepspeech2_model import DeepSpeech2
 from tools.metrics import batch_metrics, compute_wer, compute_cer
 
 # Для визуализации обучения
@@ -36,7 +36,7 @@ DEFAULTS = {
     "batch_size": 4,
     "epochs": 5,
     "steps_per_epoch": None,
-    "lr": 3e-5,  # <-- ИЗМЕНЕНИЕ: Снижена скорость обучения по умолчанию для стабильности
+    "lr": 3e-5,
     "rnn_hidden_size": 768,
     "num_rnn_layers": 5,
     "grad_clip": 5.0,
@@ -201,13 +201,15 @@ def main():
     train_loader, val_loader = build_dataloaders(args, tokenizer)
     print(f"[INFO] Train size: {len(train_loader.dataset)}, Val size: {len(val_loader.dataset) if val_loader else 0}")
 
-    model = SampleCTCModel(
+    model = DeepSpeech2(
         num_classes=tokenizer.vocab_size,
         sample_rate=args.sample_rate,
         n_mels=args.n_mels,
         hop_length=args.hop_length,
-        hidden=args.rnn_hidden_size
+        rnn_hidden_size=args.rnn_hidden_size,
+        num_rnn_layers=args.num_rnn_layers,
     ).to(device)
+
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, verbose=True)
