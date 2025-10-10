@@ -126,10 +126,12 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
         
         # --- ЗАЩИТА УРОВЕНЬ 1: Проверка соответствия длин для CTCLoss ---
         with torch.no_grad():
-            input_lengths = model.get_output_lengths(sample_lengths)
+            # <- исправлено: явно переводим input_lengths на device, чтобы не было CPU vs CUDA mismatch
+            input_lengths = model.get_output_lengths(sample_lengths).to(device)
             if not (input_lengths >= target_lengths).all():
                 # print(f"Warning: Invalid lengths found. Skipping batch. Input: {input_lengths.tolist()}, Target: {target_lengths.tolist()}")
                 continue
+
         
         # --- Прямой проход и вычисление потерь ---
         try:
