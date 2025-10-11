@@ -106,12 +106,17 @@ def build_dataloaders(args, tokenizer):
 
 def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=None):
     """Декодируем батч: берем самый вероятный символ на каждом шаге"""
+    was_training = model.training
     model.eval()
-    with torch.no_grad():
-        inp = batch_inputs.to(device)
-        logits = model(inp, sample_lengths=sample_lengths)
-        preds = torch.argmax(logits, dim=-1).cpu().tolist()
-        decs = [tokenizer.decode(p) for p in preds]
+    try:
+        with torch.no_grad():
+            inp = batch_inputs.to(device)
+            logits = model(inp, sample_lengths=sample_lengths)
+            preds = torch.argmax(logits, dim=-1).cpu().tolist()
+            decs = [tokenizer.decode(p) for p in preds]
+    finally:
+        if was_training:
+            model.train()
     return decs
 
 def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, scaler=None, wandb_run=None, comet_exp=None, global_step_start=0):
