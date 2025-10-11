@@ -92,11 +92,21 @@ def log_example(wandb_run, comet_exp, utt_id: str, waveform_np: Optional[np.ndar
 
     if _WANDB and wandb_run is not None and waveform_np is not None:
         try:
-            wandb_run.log({f"audio/{utt_id}": wandb.Audio(waveform_np, sample_rate=sr)}, step=step)
+            log_data = {}
+            log_data[f"audio_examples/{utt_id}"] = wandb.Audio(
+                waveform_np, 
+                caption=summary,
+                sample_rate=sr
+            )
+            
             fig = plot_spectrogram(waveform_np, sr)
-            wandb_run.log({f"spec/{utt_id}": wandb.Image(fig)}, step=step)
+            log_data[f"spec_examples/{utt_id}"] = wandb.Image(
+                fig, 
+                caption=summary
+            )
             plt.close(fig)
-            wandb_run.log({f"sample/{utt_id}": summary}, step=step)
+            wandb_run.log(log_data, step=step)
+
         except Exception as e:
             print(f"[WARN] WandB logging failed for {utt_id}: {e}")
 
