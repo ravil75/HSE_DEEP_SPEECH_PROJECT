@@ -129,7 +129,7 @@ class DeepSpeech2(nn.Module):
         # Финальный линейный слой
         logits = self.fc(x)
 
-        logits = torch.nan_to_num(logits, nan=0.0, posinf=1e5, neginf=-1e5)
+    
      
 
         return logits

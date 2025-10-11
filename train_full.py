@@ -3,7 +3,7 @@ import os
 import math
 import time
 import argparse
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,7 @@ from src.models.deepspeech2_model import DeepSpeech2
 from tools.metrics import batch_metrics, compute_wer, compute_cer
 from src.utils.logging import init_logging, compute_grad_norm, log_example
 from src.augmentations import WaveformAugmentations, SpecAugment
+from src.decoding.beam_search import BeamSearchDecoder
 
 try:
     import wandb
@@ -27,8 +28,6 @@ try:
 except Exception:
     WANDB_AVAILABLE = False
 
-
-# Настройки по умолчанию
 DEFAULTS = {
     "data_root": "data",
     "use_torchaudio": False,
@@ -40,7 +39,7 @@ DEFAULTS = {
     "batch_size": 4,
     "epochs": 5,
     "steps_per_epoch": None,
-    "lr": 3e-5,
+    "lr": 3e-4,
     "rnn_hidden_size": 768,
     "num_rnn_layers": 5,
     "grad_clip": 5.0,
@@ -50,7 +49,6 @@ DEFAULTS = {
 }
 
 def parse_args():
-    """Парсим аргументы командной строки"""
     p = argparse.ArgumentParser()
     p.add_argument("--data_root", default=DEFAULTS["data_root"])
     p.add_argument("--use_torchaudio", action="store_true")
@@ -70,8 +68,6 @@ def parse_args():
     p.add_argument("--save_dir", default=DEFAULTS["save_dir"])
     p.add_argument("--resume", default=None, help="путь к чекпоинту для продолжения")
     p.add_argument("--val_subset", default="test-clean", help="валидационный набор")
-
-    # Logging-related
     p.add_argument("--wandb_proj", default=None, help="WandB project name (set to enable wandb logging)")
     p.add_argument("--wandb_name", default=None, help="WandB run name (optional)")
     p.add_argument("--comet_api_key", default=None, help="Comet API key (set to enable Comet logging)")
@@ -79,10 +75,8 @@ def parse_args():
     p.add_argument("--comet_workspace", default=None, help="Comet workspace")
     p.add_argument("--log_every_steps", type=int, default=50, help="log samples/grad-norm every N steps")
 
-     # Аугментации
+    # augmentations
     p.add_argument("--no-augmentations", action="store_true", help="Отключить все аугментации")
-    
-    # Waveform аугментации
     p.add_argument("--noise-dir", type=str, default=None, help="Директория с noise файлами")
     p.add_argument("--noise-snr-db", type=float, default=10.0, help="SNR для noise injection")
     p.add_argument("--gaussian-noise-level", type=float, default=0.01, help="Уровень Gaussian noise")
@@ -91,26 +85,25 @@ def parse_args():
     p.add_argument("--p-noise", type=float, default=0.5, help="Вероятность применения noise")
     p.add_argument("--p-gain", type=float, default=0.5, help="Вероятность изменения gain")
     p.add_argument("--preload-noise", action="store_true", help="Предзагрузить noise файлы")
-    
-    # Spec аугментации
     p.add_argument("--freq-masks", type=int, default=2, help="Количество frequency masks")
     p.add_argument("--time-masks", type=int, default=2, help="Количество time masks")
     p.add_argument("--freq-width", type=int, default=27, help="Ширина frequency mask")
     p.add_argument("--time-width", type=int, default=100, help="Ширина time mask")
     p.add_argument("--spec-aug-p", type=float, default=1.0, help="Вероятность применения spec augment")
 
+    # beam-search
+    p.add_argument("--beam-decoding", action="store_true", default=True, help="Использовать beam search при декодировании для логов/валидации (по умолчанию)")
+    p.add_argument("--beam-size", type=int, default=11, help="beam size для beam search")
+
     return p.parse_args()
 
 def build_dataloaders(args, tokenizer):
-    """Создаем загрузчики данных для обучения и валидации"""
-
     waveform_aug = None
     spec_aug = None
 
     if not args.no_augmentations:
-        # Waveform аугментации
         waveform_aug = WaveformAugmentations(
-            noise_dir=args.noise_dir,  # добавить в аргументы
+            noise_dir=args.noise_dir,
             noise_snr_db=args.noise_snr_db,
             gaussian_noise_level=args.gaussian_noise_level,
             gain_min=args.gain_min,
@@ -119,8 +112,6 @@ def build_dataloaders(args, tokenizer):
             p_gain=args.p_gain,
             preload_noise=args.preload_noise,
         )
-        
-        # Spec аугментации
         spec_aug = SpecAugment(
             freq_masks=args.freq_masks,
             time_masks=args.time_masks,
@@ -130,15 +121,15 @@ def build_dataloaders(args, tokenizer):
         )
 
     train_ds = CustomDirDataset(
-        args.data_root, 
-        sample_rate=args.sample_rate, 
+        args.data_root,
+        sample_rate=args.sample_rate,
         use_torchaudio=args.use_torchaudio,
-        librispeech_url=args.libri_subset if args.use_torchaudio else None, 
+        librispeech_url=args.libri_subset if args.use_torchaudio else None,
         download=args.download,
         waveform_augmentations=waveform_aug,
         spec_augmentations=spec_aug,
     )
-    
+
     val_ds = None
     if args.use_torchaudio:
         val_ds = CustomDirDataset(
@@ -154,13 +145,11 @@ def build_dataloaders(args, tokenizer):
             )
 
     collate = lambda b: collate_fn(b, tokenizer=tokenizer, hop_length=args.hop_length)
-    
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, num_workers=args.num_workers)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=args.num_workers) if val_ds is not None else None
     return train_loader, val_loader
 
 def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=None):
-    """Декодируем батч: берем самый вероятный символ на каждом шаге"""
     was_training = model.training
     model.eval()
     try:
@@ -174,7 +163,7 @@ def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=N
             model.train()
     return decs
 
-def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, scaler=None, wandb_run=None, comet_exp=None, global_step_start=0):
+def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, scaler=None, wandb_run=None, comet_exp=None, global_step_start=0, beam_decoder: Optional[BeamSearchDecoder]=None):
     model.train()
     total_loss = 0.0
     n_steps = 0
@@ -189,19 +178,16 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
 
-        # Проверка соответствия длин для CTCLoss
         with torch.no_grad():
             input_lengths = model.get_output_lengths(sample_lengths).to(device)
             if not (input_lengths >= target_lengths).all():
                 print(f"[WARN] Invalid lengths found. Skipping batch. Input: {input_lengths.tolist()}, Target: {target_lengths.tolist()}")
-                continue
 
         try:
             use_amp = (scaler is not None) and (device.type == "cuda")
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 logits = model(inputs, sample_lengths=sample_lengths)
 
-                # Проверка на численную нестабильность
                 if torch.isnan(logits).any() or torch.isinf(logits).any():
                     print("[WARN] Found NaN/Inf in logits. Skipping batch.")
                     continue
@@ -209,7 +195,6 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                 log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
                 loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
 
-            # Backward + optimizer step
             if use_amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -227,11 +212,9 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
             n_steps += 1
             global_step += 1
 
-            # progress bar
             if n_steps % 10 == 0:
                 pbar.set_postfix({"loss": f"{total_loss / n_steps:.4f}"})
 
-            # Logging to W&B / Comet
             current_lr = optimizer.param_groups[0].get("lr", 0.0)
             if wandb_run is not None:
                 try:
@@ -251,13 +234,18 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                 except Exception as e:
                     print(f"[WARN] comet log failed: {e}")
 
-            # Логирование средних WER/CER по батчу каждые N шагов
             if global_step % args.log_every_steps == 0:
-                # Декодируем весь батч для вычисления средних метрик
                 try:
-                    all_decs = greedy_decode_batch(model, inputs, device, tokenizer, sample_lengths=sample_lengths)
+                    # use already computed logits to avoid extra forward
+                    if beam_decoder is not None:
+                        # pass input lengths as python list of ints
+                        in_lens: List[int] = sample_lengths.cpu().tolist()
+                        all_decs = beam_decoder.decode_batch(logits, input_lengths=in_lens)
+                    else:
+                        preds = torch.argmax(logits, dim=-1).cpu().tolist()
+                        all_decs = [tokenizer.decode(p) for p in preds]
+
                     all_refs = batch.get("texts", [""] * len(all_decs))
-                    
                     batch_wers = []
                     batch_cers = []
                     for ref, pred in zip(all_refs, all_decs):
@@ -268,31 +256,31 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                             batch_cers.append(cer_val)
                         except Exception:
                             continue
-                    
-                    if batch_wers and batch_cers:  # если есть валидные метрики
+
+                    if batch_wers and batch_cers:
                         avg_wer = np.mean(batch_wers)
                         avg_cer = np.mean(batch_cers)
-                        
                         if wandb_run is not None:
                             wandb_run.log({
                                 "train/wer_batch": avg_wer,
                                 "train/cer_batch": avg_cer,
                             }, step=global_step)
-                            
                         if comet_exp is not None:
                             comet_exp.log_metric("train_wer_batch", avg_wer, step=global_step)
                             comet_exp.log_metric("train_cer_batch", avg_cer, step=global_step)
-                            
                         print(f"[Step {global_step}] Batch metrics - WER: {avg_wer:.4f}, CER: {avg_cer:.4f}")
-                            
+
                 except Exception as e:
                     print(f"[WARN] Batch metrics computation failed: {e}")
 
-                # Логирование одного примера (оставляем существующий код)
+                # single example
                 try:
-                    single_inp = inputs[:1]
-                    single_len = sample_lengths[:1]
-                    decs = greedy_decode_batch(model, single_inp, device, tokenizer, sample_lengths=single_len)
+                    single_len = sample_lengths[:1].cpu().tolist()
+                    if beam_decoder is not None:
+                        decs = beam_decoder.decode_batch(logits[:1], input_lengths=single_len)
+                    else:
+                        preds = torch.argmax(logits[:1], dim=-1).cpu().tolist()
+                        decs = [tokenizer.decode(p) for p in preds]
                     pred_text = decs[0] if len(decs) > 0 else ""
                 except Exception:
                     pred_text = ""
@@ -304,12 +292,10 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                 except Exception:
                     wer, cer = 0.0, 0.0
 
-                # waveform -> numpy 1D
                 wf_np = None
                 try:
                     wf = inputs[0].detach().cpu().numpy()
                     if wf.ndim == 3:
-                        # [B,C,T] -> [C,T] for first sample
                         wf = wf[0]
                     if wf.ndim == 2:
                         wf_np = wf.mean(axis=0)
@@ -330,22 +316,26 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
     avg_loss = total_loss / max(1, n_steps)
     return avg_loss, global_step
 
-
-def validate(model, loader, device, tokenizer, args, max_batches: Optional[int] = None):
-    """Валидация модели"""
+def validate(model, loader, device, tokenizer, args, beam_decoder: Optional[BeamSearchDecoder]=None, max_batches: Optional[int] = None):
     model.eval()
     all_refs, all_hyps = [], []
-    
+
     with torch.no_grad():
         pbar = tqdm(loader, desc="valid", leave=False)
         for i, batch in enumerate(pbar):
-            decs = greedy_decode_batch(model, batch["inputs"], device, tokenizer, sample_lengths=batch["sample_lengths"])
+            if beam_decoder is not None:
+                logits = model(batch["inputs"].to(device), sample_lengths=batch["sample_lengths"].to(device))
+                in_lens = batch["sample_lengths"].cpu().tolist()
+                decs = beam_decoder.decode_batch(logits, input_lengths=in_lens)
+            else:
+                decs = greedy_decode_batch(model, batch["inputs"], device, tokenizer, sample_lengths=batch["sample_lengths"])
+
             refs = batch.get("texts", [""] * len(decs))
             all_refs.extend(refs)
             all_hyps.extend(decs)
             if max_batches is not None and i + 1 >= max_batches:
                 break
-                
+
     avg_wer, avg_cer, count = batch_metrics(all_refs, all_hyps)
     return avg_wer, avg_cer, count
 
@@ -354,13 +344,18 @@ def save_checkpoint(state: dict, path: str):
     torch.save(state, path)
 
 def main():
-    """Главная функция обучения"""
     args = parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     device = torch.device(args.device)
     print(f"[INFO] Device={device}, data_root={args.data_root}, use_torchaudio={args.use_torchaudio}")
 
     tokenizer = CharTokenizer()
+
+    beam_decoder = None
+    if args.beam_decoding:
+        beam_decoder = BeamSearchDecoder(tokenizer, beam_size=args.beam_size, blank_id=tokenizer.blank)
+        print(f"[INFO] Using beam search decoder with beam size {args.beam_size}")
+
     train_loader, val_loader = build_dataloaders(args, tokenizer)
     print(f"[INFO] Train size: {len(train_loader.dataset)}, Val size: {len(val_loader.dataset) if val_loader else 0}")
 
@@ -372,7 +367,6 @@ def main():
         rnn_hidden_size=args.rnn_hidden_size,
         num_rnn_layers=args.num_rnn_layers,
     ).to(device)
-
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, verbose=True)
@@ -401,20 +395,27 @@ def main():
     global_step = 0
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        train_loss, global_step = run_one_epoch(model, train_loader, optimizer, ctc_loss, device, tokenizer, 
-                                                args, scaler, wandb_run=wandb_run, comet_exp=comet_exp, 
-                                                global_step_start=global_step)
+        train_loss, global_step = run_one_epoch(
+            model, train_loader, optimizer, ctc_loss, device, tokenizer,
+            args, scaler, wandb_run=wandb_run, comet_exp=comet_exp,
+            global_step_start=global_step, beam_decoder=beam_decoder
+        )
 
         epoch_time = time.time() - t0
 
         val_wer, val_cer = float("nan"), float("nan")
         if val_loader:
-            val_wer, val_cer, _ = validate(model, val_loader, device, tokenizer, args)
+            val_wer, val_cer, _ = validate(model, val_loader, device, tokenizer, args, beam_decoder=beam_decoder)
 
-            # Log a couple of validation examples (audio + spec + text) for inspection
             try:
                 val_batch = next(iter(val_loader))
-                decs = greedy_decode_batch(model, val_batch["inputs"], device, tokenizer, sample_lengths=val_batch["sample_lengths"])
+                if beam_decoder is not None:
+                    logits_val = model(val_batch["inputs"].to(device), sample_lengths=val_batch["sample_lengths"].to(device))
+                    in_lens = val_batch["sample_lengths"].cpu().tolist()
+                    decs = beam_decoder.decode_batch(logits_val, input_lengths=in_lens)
+                else:
+                    decs = greedy_decode_batch(model, val_batch["inputs"], device, tokenizer, sample_lengths=val_batch["sample_lengths"])
+
                 n_examples = min(2, len(decs))
                 for i in range(n_examples):
                     pred = decs[i]
@@ -438,7 +439,6 @@ def main():
         print(f"[Epoch {epoch}/{args.epochs}] train_loss={train_loss:.4f} val_wer={val_wer:.4f} val_cer={val_cer:.4f} time={epoch_time:.1f}s")
         scheduler.step(val_wer if not math.isnan(val_wer) else train_loss)
 
-        # Log epoch-level metrics to W&B/Comet (tied to epoch number)
         if wandb_run:
             try:
                 wandb_run.log({
@@ -467,7 +467,6 @@ def main():
             save_checkpoint({"epoch": epoch, "state_dict": model.state_dict(), "best_wer": best_wer}, best_path)
             print(f"[INFO] New best model saved to {best_path} (WER={best_wer:.4f})")
 
-            # Save as W&B artifact / Comet asset if available
             if wandb_run:
                 try:
                     wandb_run.summary["best_val_wer"] = best_wer
@@ -482,7 +481,6 @@ def main():
                 except Exception as e:
                     print(f"[WARN] Failed to push checkpoint to Comet: {e}")
 
-    # Properly finish logging sessions
     if wandb_run:
         try:
             wandb_run.finish()
