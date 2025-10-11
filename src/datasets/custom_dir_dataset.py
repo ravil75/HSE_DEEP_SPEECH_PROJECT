@@ -163,7 +163,7 @@ class CustomDirDataset(torch.utils.data.Dataset):
         waveform = self._ensure_mono(waveform)
         waveform, sr = self._resample_if_needed(waveform, int(sr))
 
-        if self.waveform_augmentations is not None and self.training:
+        if self.waveform_augmentations is not None:
             waveform = self.waveform_augmentations(waveform, sr)
 
         text = self.transcriptions.get(utt_str, None)
@@ -174,7 +174,7 @@ class CustomDirDataset(torch.utils.data.Dataset):
             feats = self.transforms(feats, sr)
 
         
-        if self.spec_augmentations is not None and self.training:
+        if self.spec_augmentations is not None:
             feats = self.spec_augmentations(feats)    
 
         if self.return_tensor and not isinstance(feats, torch.Tensor):
