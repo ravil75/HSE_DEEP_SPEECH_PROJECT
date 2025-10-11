@@ -19,6 +19,7 @@ from src.datasets.collate import collate_fn
 from src.models.deepspeech2_model import DeepSpeech2
 from tools.metrics import batch_metrics, compute_wer, compute_cer
 from src.utils.logging import init_logging, compute_grad_norm, log_example
+from src.augmentations import WaveformAugmentations, SpecAugment
 
 try:
     import wandb
@@ -78,13 +79,64 @@ def parse_args():
     p.add_argument("--comet_workspace", default=None, help="Comet workspace")
     p.add_argument("--log_every_steps", type=int, default=50, help="log samples/grad-norm every N steps")
 
+     # Аугментации
+    p.add_argument("--no-augmentations", action="store_true", help="Отключить все аугментации")
+    
+    # Waveform аугментации
+    p.add_argument("--noise-dir", type=str, default=None, help="Директория с noise файлами")
+    p.add_argument("--noise-snr-db", type=float, default=10.0, help="SNR для noise injection")
+    p.add_argument("--gaussian-noise-level", type=float, default=0.01, help="Уровень Gaussian noise")
+    p.add_argument("--gain-min", type=float, default=0.75, help="Минимальное усиление")
+    p.add_argument("--gain-max", type=float, default=1.25, help="Максимальное усиление")
+    p.add_argument("--p-noise", type=float, default=0.5, help="Вероятность применения noise")
+    p.add_argument("--p-gain", type=float, default=0.5, help="Вероятность изменения gain")
+    p.add_argument("--preload-noise", action="store_true", help="Предзагрузить noise файлы")
+    
+    # Spec аугментации
+    p.add_argument("--freq-masks", type=int, default=2, help="Количество frequency masks")
+    p.add_argument("--time-masks", type=int, default=2, help="Количество time masks")
+    p.add_argument("--freq-width", type=int, default=27, help="Ширина frequency mask")
+    p.add_argument("--time-width", type=int, default=100, help="Ширина time mask")
+    p.add_argument("--spec-aug-p", type=float, default=1.0, help="Вероятность применения spec augment")
+
     return p.parse_args()
 
 def build_dataloaders(args, tokenizer):
     """Создаем загрузчики данных для обучения и валидации"""
+
+    waveform_aug = None
+    spec_aug = None
+
+    if not args.no_augmentations:
+        # Waveform аугментации
+        waveform_aug = WaveformAugmentations(
+            noise_dir=args.noise_dir,  # добавить в аргументы
+            noise_snr_db=args.noise_snr_db,
+            gaussian_noise_level=args.gaussian_noise_level,
+            gain_min=args.gain_min,
+            gain_max=args.gain_max,
+            p_noise=args.p_noise,
+            p_gain=args.p_gain,
+            preload_noise=args.preload_noise,
+        )
+        
+        # Spec аугментации
+        spec_aug = SpecAugment(
+            freq_masks=args.freq_masks,
+            time_masks=args.time_masks,
+            freq_width=args.freq_width,
+            time_width=args.time_width,
+            p=args.spec_aug_p,
+        )
+
     train_ds = CustomDirDataset(
-        args.data_root, sample_rate=args.sample_rate, use_torchaudio=args.use_torchaudio,
-        librispeech_url=args.libri_subset if args.use_torchaudio else None, download=args.download,
+        args.data_root, 
+        sample_rate=args.sample_rate, 
+        use_torchaudio=args.use_torchaudio,
+        librispeech_url=args.libri_subset if args.use_torchaudio else None, 
+        download=args.download,
+        waveform_augmentations=waveform_aug,
+        spec_augmentations=spec_aug,
     )
     
     val_ds = None
@@ -92,11 +144,14 @@ def build_dataloaders(args, tokenizer):
         val_ds = CustomDirDataset(
             args.data_root, sample_rate=args.sample_rate, use_torchaudio=True,
             librispeech_url=args.val_subset, download=args.download,
+            waveform_augmentations=None, spec_augmentations=None
         )
     else:
         val_root = os.path.join(args.data_root, "val")
         if os.path.isdir(val_root):
-            val_ds = CustomDirDataset(val_root, sample_rate=args.sample_rate)
+            val_ds = CustomDirDataset(val_root, sample_rate=args.sample_rate,
+                                      waveform_augmentations=None, spec_augmentations=None
+            )
 
     collate = lambda b: collate_fn(b, tokenizer=tokenizer, hop_length=args.hop_length)
     

@@ -1,3 +1,4 @@
+# \scripts\compute_metrics.py
 import os
 import argparse
 from tools.metrics import compute_wer, compute_cer

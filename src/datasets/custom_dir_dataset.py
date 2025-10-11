@@ -6,6 +6,8 @@ import glob
 import torch
 import torchaudio
 from torchaudio.datasets import LIBRISPEECH
+from src.augmentations import WaveformAugmentations, SpecAugment
+
 
 AUDIO_EXTS = [".flac", ".wav", ".mp3"]
 
@@ -53,6 +55,8 @@ class CustomDirDataset(torch.utils.data.Dataset):
         root: str,
         sample_rate: int = 16000,
         transforms=None,
+        waveform_augmentations: Optional[WaveformAugmentations] = None,
+        spec_augmentations: Optional[SpecAugment] = None,
         return_tensor: bool = True,
         use_torchaudio: bool = False,
         librispeech_url: Optional[str] = "train-clean-100",
@@ -124,6 +128,10 @@ class CustomDirDataset(torch.utils.data.Dataset):
                         txt = ""
                     self.transcriptions[utt] = txt
 
+        self.waveform_augmentations = waveform_augmentations
+        self.spec_augmentations = spec_augmentations
+            
+
     def __len__(self):
         return len(self.audio_files)
 
@@ -155,12 +163,19 @@ class CustomDirDataset(torch.utils.data.Dataset):
         waveform = self._ensure_mono(waveform)
         waveform, sr = self._resample_if_needed(waveform, int(sr))
 
+        if self.waveform_augmentations is not None and self.training:
+            waveform = self.waveform_augmentations(waveform, sr)
+
         text = self.transcriptions.get(utt_str, None)
         path_info = path
         feats = waveform
 
         if self.transforms is not None:
             feats = self.transforms(feats, sr)
+
+        
+        if self.spec_augmentations is not None and self.training:
+            feats = self.spec_augmentations(feats)    
 
         if self.return_tensor and not isinstance(feats, torch.Tensor):
             feats = torch.tensor(feats)
