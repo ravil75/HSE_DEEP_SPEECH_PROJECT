@@ -104,8 +104,13 @@ def log_example(wandb_run, comet_exp, utt_id: str, waveform_np: Optional[np.ndar
                 fig, 
                 caption=summary
             )
-            plt.close(fig)
+            
+           
+            log_data["metrics/wer_example"] = wer
+            log_data["metrics/cer_example"] = cer
+            
             wandb_run.log(log_data, step=step)
+            plt.close(fig)
 
         except Exception as e:
             print(f"[WARN] WandB logging failed for {utt_id}: {e}")
@@ -121,5 +126,9 @@ def log_example(wandb_run, comet_exp, utt_id: str, waveform_np: Optional[np.ndar
             comet_exp.log_image(buf, name=f"spec_{utt_id}.png")
             plt.close(fig)
             comet_exp.log_text(summary)
+            
+            comet_exp.log_metric("wer_example", wer, step=step)
+            comet_exp.log_metric("cer_example", cer, step=step)
+            
         except Exception as e:
             print(f"[WARN] Comet logging failed for {utt_id}: {e}")

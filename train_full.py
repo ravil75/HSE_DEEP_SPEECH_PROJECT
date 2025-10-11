@@ -196,9 +196,44 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                 except Exception as e:
                     print(f"[WARN] comet log failed: {e}")
 
-            # Log example prediction every N steps
+            # Логирование средних WER/CER по батчу каждые N шагов
             if global_step % args.log_every_steps == 0:
-                # greedy decode 1 sample
+                # Декодируем весь батч для вычисления средних метрик
+                try:
+                    all_decs = greedy_decode_batch(model, inputs, device, tokenizer, sample_lengths=sample_lengths)
+                    all_refs = batch.get("texts", [""] * len(all_decs))
+                    
+                    batch_wers = []
+                    batch_cers = []
+                    for ref, pred in zip(all_refs, all_decs):
+                        try:
+                            wer_val = compute_wer(ref, pred)
+                            cer_val = compute_cer(ref, pred)
+                            batch_wers.append(wer_val)
+                            batch_cers.append(cer_val)
+                        except Exception:
+                            continue
+                    
+                    if batch_wers and batch_cers:  # если есть валидные метрики
+                        avg_wer = np.mean(batch_wers)
+                        avg_cer = np.mean(batch_cers)
+                        
+                        if wandb_run is not None:
+                            wandb_run.log({
+                                "train/wer_batch": avg_wer,
+                                "train/cer_batch": avg_cer,
+                            }, step=global_step)
+                            
+                        if comet_exp is not None:
+                            comet_exp.log_metric("train_wer_batch", avg_wer, step=global_step)
+                            comet_exp.log_metric("train_cer_batch", avg_cer, step=global_step)
+                            
+                        print(f"[Step {global_step}] Batch metrics - WER: {avg_wer:.4f}, CER: {avg_cer:.4f}")
+                            
+                except Exception as e:
+                    print(f"[WARN] Batch metrics computation failed: {e}")
+
+                # Логирование одного примера (оставляем существующий код)
                 try:
                     single_inp = inputs[:1]
                     single_len = sample_lengths[:1]
