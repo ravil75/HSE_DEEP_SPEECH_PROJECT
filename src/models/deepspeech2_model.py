@@ -4,6 +4,8 @@ import torch.nn as nn
 import torchaudio
 from typing import Optional
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, PackedSequence
+from src.augmentations import SpecAugment
+
 
 
 class DeepSpeech2(nn.Module):
@@ -16,6 +18,7 @@ class DeepSpeech2(nn.Module):
         hop_length: int = 160,
         rnn_hidden_size: int = 768,
         num_rnn_layers: int = 5,
+        use_spec_augment: bool = True
     ):
         super().__init__()
         self.num_classes = int(num_classes)
@@ -31,6 +34,7 @@ class DeepSpeech2(nn.Module):
             sample_rate=self.sample_rate, n_fft=self.n_fft, hop_length=self.hop_length, n_mels=self.n_mels
         )
         self.amptodb = torchaudio.transforms.AmplitudeToDB()
+        self.spec_augmentor = SpecAugment() if use_spec_augment else None
 
         # Сверточные слои для извлечения признаков
         self.conv = nn.Sequential(
@@ -87,6 +91,9 @@ class DeepSpeech2(nn.Module):
         x = self.melspec(waveforms)
 
         x = self.amptodb(x.clamp(min=1e-5))
+
+        if self.spec_augmentor is not None and self.training:
+            x = self.spec_augmentor(x)
 
         # Применяем свертки
         x = x.unsqueeze(1)

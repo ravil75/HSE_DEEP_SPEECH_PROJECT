@@ -56,7 +56,6 @@ class CustomDirDataset(torch.utils.data.Dataset):
         sample_rate: int = 16000,
         transforms=None,
         waveform_augmentations: Optional[WaveformAugmentations] = None,
-        spec_augmentations: Optional[SpecAugment] = None,
         return_tensor: bool = True,
         use_torchaudio: bool = False,
         librispeech_url: Optional[str] = "train-clean-100",
@@ -129,7 +128,6 @@ class CustomDirDataset(torch.utils.data.Dataset):
                     self.transcriptions[utt] = txt
 
         self.waveform_augmentations = waveform_augmentations
-        self.spec_augmentations = spec_augmentations
             
 
     def __len__(self):
@@ -171,11 +169,7 @@ class CustomDirDataset(torch.utils.data.Dataset):
         feats = waveform
 
         if self.transforms is not None:
-            feats = self.transforms(feats, sr)
-
-        
-        if self.spec_augmentations is not None:
-            feats = self.spec_augmentations(feats)    
+            feats = self.transforms(feats, sr)  
 
         if self.return_tensor and not isinstance(feats, torch.Tensor):
             feats = torch.tensor(feats)

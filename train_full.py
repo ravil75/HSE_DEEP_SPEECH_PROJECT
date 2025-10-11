@@ -126,8 +126,7 @@ def build_dataloaders(args, tokenizer):
         use_torchaudio=args.use_torchaudio,
         librispeech_url=args.libri_subset if args.use_torchaudio else None,
         download=args.download,
-        waveform_augmentations=waveform_aug,
-        spec_augmentations=spec_aug,
+        waveform_augmentations=waveform_aug
     )
 
     val_ds = None
@@ -135,13 +134,13 @@ def build_dataloaders(args, tokenizer):
         val_ds = CustomDirDataset(
             args.data_root, sample_rate=args.sample_rate, use_torchaudio=True,
             librispeech_url=args.val_subset, download=args.download,
-            waveform_augmentations=None, spec_augmentations=None
+            waveform_augmentations=None
         )
     else:
         val_root = os.path.join(args.data_root, "val")
         if os.path.isdir(val_root):
             val_ds = CustomDirDataset(val_root, sample_rate=args.sample_rate,
-                                      waveform_augmentations=None, spec_augmentations=None
+                                      waveform_augmentations=None
             )
 
     collate = lambda b: collate_fn(b, tokenizer=tokenizer, hop_length=args.hop_length)
@@ -155,13 +154,17 @@ def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=N
     try:
         with torch.no_grad():
             inp = batch_inputs.to(device)
+            if sample_lengths is not None:
+                sample_lengths = sample_lengths.to(device)
             logits = model(inp, sample_lengths=sample_lengths)
+           
             preds = torch.argmax(logits, dim=-1).cpu().tolist()
             decs = [tokenizer.decode(p) for p in preds]
     finally:
         if was_training:
             model.train()
     return decs
+
 
 def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, scaler=None, wandb_run=None, comet_exp=None, global_step_start=0, beam_decoder: Optional[BeamSearchDecoder]=None):
     model.train()
@@ -178,10 +181,12 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
 
+        # compute input lengths (frames) and validate BEFORE forward
         with torch.no_grad():
             input_lengths = model.get_output_lengths(sample_lengths).to(device)
             if not (input_lengths >= target_lengths).all():
                 print(f"[WARN] Invalid lengths found. Skipping batch. Input: {input_lengths.tolist()}, Target: {target_lengths.tolist()}")
+                continue  # важно: пропускаем батч, иначе CTCLoss упадёт
 
         try:
             use_amp = (scaler is not None) and (device.type == "cuda")
@@ -234,16 +239,34 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                 except Exception as e:
                     print(f"[WARN] comet log failed: {e}")
 
+            # ---- batch metrics / logging ----
             if global_step % args.log_every_steps == 0:
                 try:
-                    # use already computed logits to avoid extra forward
-                    if beam_decoder is not None:
-                        # pass input lengths as python list of ints
-                        in_lens: List[int] = sample_lengths.cpu().tolist()
-                        all_decs = beam_decoder.decode_batch(logits, input_lengths=in_lens)
-                    else:
-                        preds = torch.argmax(logits, dim=-1).cpu().tolist()
-                        all_decs = [tokenizer.decode(p) for p in preds]
+                    was_training = model.training
+                    model.eval()
+                    with torch.no_grad():
+                        # всегда используем выходные длины, а не сырые sample_lengths
+                        logits_cpu = logits.detach().cpu()  # безопасно для декодера
+                        # compute output lengths based on sample_lengths
+                        output_lengths = model.get_output_lengths(sample_lengths).cpu()
+                        # ensure shape (B, T, C)
+                        if logits_cpu.dim() == 3:
+                            B, T, C = logits_cpu.shape
+                        else:
+                            logits_cpu = logits_cpu.permute(1, 0, 2)
+                            B, T, C = logits_cpu.shape
+                        output_lengths = output_lengths.clamp(min=1, max=T).tolist()
+
+                        if beam_decoder is not None:
+                            try:
+                                all_decs = beam_decoder.decode_batch(logits_cpu, input_lengths=output_lengths)
+                            except TypeError:
+                                all_decs = beam_decoder.decode_batch(logits_cpu.numpy(), input_lengths=output_lengths)
+                        else:
+                            preds = torch.argmax(logits, dim=-1).cpu().tolist()
+                            all_decs = [tokenizer.decode(p) for p in preds]
+                    if was_training:
+                        model.train()
 
                     all_refs = batch.get("texts", [""] * len(all_decs))
                     batch_wers = []
@@ -273,11 +296,23 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                 except Exception as e:
                     print(f"[WARN] Batch metrics computation failed: {e}")
 
-                # single example
+                # single example (корректно берём выходную длину)
                 try:
-                    single_len = sample_lengths[:1].cpu().tolist()
+                    logits_cpu_1 = logits[:1].detach().cpu()
+                    # compute single output length from sample_lengths (device->CPU done in get_output_lengths)
+                    single_out_len = model.get_output_lengths(sample_lengths[:1].to(device)).cpu()
+                    # clamp using the single logits shape
+                    if logits_cpu_1.dim() == 3:
+                        _, T1, _ = logits_cpu_1.shape
+                    else:
+                        logits_cpu_1 = logits_cpu_1.permute(1, 0, 2)
+                        _, T1, _ = logits_cpu_1.shape
+                    single_out_len = single_out_len.clamp(min=1, max=T1).tolist()
                     if beam_decoder is not None:
-                        decs = beam_decoder.decode_batch(logits[:1], input_lengths=single_len)
+                        try:
+                            decs = beam_decoder.decode_batch(logits_cpu_1, input_lengths=single_out_len)
+                        except TypeError:
+                            decs = beam_decoder.decode_batch(logits_cpu_1.numpy(), input_lengths=single_out_len)
                     else:
                         preds = torch.argmax(logits[:1], dim=-1).cpu().tolist()
                         decs = [tokenizer.decode(p) for p in preds]
@@ -316,6 +351,7 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
     avg_loss = total_loss / max(1, n_steps)
     return avg_loss, global_step
 
+
 def validate(model, loader, device, tokenizer, args, beam_decoder: Optional[BeamSearchDecoder]=None, max_batches: Optional[int] = None):
     model.eval()
     all_refs, all_hyps = [], []
@@ -324,10 +360,20 @@ def validate(model, loader, device, tokenizer, args, beam_decoder: Optional[Beam
         pbar = tqdm(loader, desc="valid", leave=False)
         for i, batch in enumerate(pbar):
             if beam_decoder is not None:
-                logits = model(batch["inputs"].to(device), sample_lengths=batch["sample_lengths"].to(device))
-                in_lens = batch["sample_lengths"].cpu().tolist()
-                decs = beam_decoder.decode_batch(logits, input_lengths=in_lens)
+                sample_lengths = batch["sample_lengths"].to(device)
+                logits = model(batch["inputs"].to(device), sample_lengths=sample_lengths)
+                logits_cpu = logits.detach().cpu()
+                # ensure shape (B, T, C)
+                if logits_cpu.dim() != 3:
+                    logits_cpu = logits_cpu.permute(1, 0, 2)
+                B, T, C = logits_cpu.shape
+                output_lengths = model.get_output_lengths(sample_lengths).cpu().clamp(min=1, max=T).tolist()
+                try:
+                    decs = beam_decoder.decode_batch(logits_cpu, input_lengths=output_lengths)
+                except TypeError:
+                    decs = beam_decoder.decode_batch(logits_cpu.numpy(), input_lengths=output_lengths)
             else:
+                # greedy_decode_batch moves sample_lengths to device internally
                 decs = greedy_decode_batch(model, batch["inputs"], device, tokenizer, sample_lengths=batch["sample_lengths"])
 
             refs = batch.get("texts", [""] * len(decs))
@@ -338,6 +384,7 @@ def validate(model, loader, device, tokenizer, args, beam_decoder: Optional[Beam
 
     avg_wer, avg_cer, count = batch_metrics(all_refs, all_hyps)
     return avg_wer, avg_cer, count
+
 
 def save_checkpoint(state: dict, path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -366,6 +413,7 @@ def main():
         hop_length=args.hop_length,
         rnn_hidden_size=args.rnn_hidden_size,
         num_rnn_layers=args.num_rnn_layers,
+        use_spec_augment=True
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
@@ -410,9 +458,14 @@ def main():
             try:
                 val_batch = next(iter(val_loader))
                 if beam_decoder is not None:
-                    logits_val = model(val_batch["inputs"].to(device), sample_lengths=val_batch["sample_lengths"].to(device))
-                    in_lens = val_batch["sample_lengths"].cpu().tolist()
-                    decs = beam_decoder.decode_batch(logits_val, input_lengths=in_lens)
+                    sample_lengths = val_batch["sample_lengths"].to(device)
+                    model.eval()
+                    with torch.no_grad():
+                        logits_val = model(val_batch["inputs"].to(device), sample_lengths=sample_lengths)
+
+                    output_lengths = model.get_output_lengths(sample_lengths).detach().cpu().tolist()
+                    decs = beam_decoder.decode_batch(logits_val, input_lengths=output_lengths)
+
                 else:
                     decs = greedy_decode_batch(model, val_batch["inputs"], device, tokenizer, sample_lengths=val_batch["sample_lengths"])
 
@@ -421,7 +474,8 @@ def main():
                     pred = decs[i]
                     ref = val_batch.get("texts", [""] * len(decs))[i]
                     utt = val_batch.get("utt_ids", ["val_sample"] * len(decs))[i]
-                    wf = val_batch["inputs"][i].cpu().numpy()
+                    wf = val_batch["inputs"][i].detach().cpu().numpy()
+
                     if wf.ndim == 3:
                         wf = wf[0]
                     if wf.ndim == 2:
