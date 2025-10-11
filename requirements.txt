@@ -15,3 +15,5 @@ pre-commit
 editdistance
 jiwer
 wandb
+librosa
+soundfile

@@ -1,3 +1,4 @@
+# train_full.py
 import os
 import math
 import time
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+import numpy as np
 
 from tqdm import tqdm
 
@@ -16,13 +18,14 @@ from src.datasets.custom_dir_dataset import CustomDirDataset
 from src.datasets.collate import collate_fn
 from src.models.deepspeech2_model import DeepSpeech2
 from tools.metrics import batch_metrics, compute_wer, compute_cer
+from src.utils.logging import init_logging, compute_grad_norm, log_example
 
-# Для визуализации обучения
 try:
     import wandb
     WANDB_AVAILABLE = True
 except Exception:
     WANDB_AVAILABLE = False
+
 
 # Настройки по умолчанию
 DEFAULTS = {
@@ -64,17 +67,18 @@ def parse_args():
     p.add_argument("--grad_clip", type=float, default=DEFAULTS["grad_clip"])
     p.add_argument("--num_workers", type=int, default=DEFAULTS["num_workers"])
     p.add_argument("--save_dir", default=DEFAULTS["save_dir"])
-    p.add_argument("--wandb_proj", default=None)
     p.add_argument("--resume", default=None, help="путь к чекпоинту для продолжения")
     p.add_argument("--val_subset", default="test-clean", help="валидационный набор")
-    return p.parse_args()
 
-def init_wandb(args, config: Dict[str, Any]):
-    """Инициализация WandB для логирования"""
-    if not WANDB_AVAILABLE or args.wandb_proj is None:
-        return None
-    run = wandb.init(project=args.wandb_proj, config=config, reinit=True)
-    return run
+    # Logging-related
+    p.add_argument("--wandb_proj", default=None, help="WandB project name (set to enable wandb logging)")
+    p.add_argument("--wandb_name", default=None, help="WandB run name (optional)")
+    p.add_argument("--comet_api_key", default=None, help="Comet API key (set to enable Comet logging)")
+    p.add_argument("--comet_project", default=None, help="Comet project name")
+    p.add_argument("--comet_workspace", default=None, help="Comet workspace")
+    p.add_argument("--log_every_steps", type=int, default=50, help="log samples/grad-norm every N steps")
+
+    return p.parse_args()
 
 def build_dataloaders(args, tokenizer):
     """Создаем загрузчики данных для обучения и валидации"""
@@ -110,65 +114,127 @@ def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=N
         decs = [tokenizer.decode(p) for p in preds]
     return decs
 
-def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, scaler=None):
+def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, scaler=None, wandb_run=None, comet_exp=None, global_step_start=0):
     model.train()
     total_loss = 0.0
     n_steps = 0
+    global_step = int(global_step_start)
     pbar = tqdm(loader, desc="train", leave=False)
 
     for batch in pbar:
         optimizer.zero_grad()
-        
+
         inputs = batch["inputs"].to(device)
         sample_lengths = batch["sample_lengths"].to(device)
         targets = batch["targets"].to(device)
         target_lengths = batch["target_lengths"].to(device)
-        
-        # --- ЗАЩИТА УРОВЕНЬ 1: Проверка соответствия длин для CTCLoss ---
+
+        # Проверка соответствия длин для CTCLoss
         with torch.no_grad():
-            # <- исправлено: явно переводим input_lengths на device, чтобы не было CPU vs CUDA mismatch
             input_lengths = model.get_output_lengths(sample_lengths).to(device)
             if not (input_lengths >= target_lengths).all():
-                # print(f"Warning: Invalid lengths found. Skipping batch. Input: {input_lengths.tolist()}, Target: {target_lengths.tolist()}")
+                print(f"[WARN] Invalid lengths found. Skipping batch. Input: {input_lengths.tolist()}, Target: {target_lengths.tolist()}")
                 continue
 
-        
-        # --- Прямой проход и вычисление потерь ---
         try:
-            use_amp = scaler is not None
+            use_amp = (scaler is not None) and (device.type == "cuda")
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 logits = model(inputs, sample_lengths=sample_lengths)
-                
-                # --- ЗАЩИТА УРОВЕНЬ 2: Проверка на численную нестабильность в модели ---
+
+                # Проверка на численную нестабильность
                 if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    print("!!! Found NaN/Inf in model logits. Skipping batch due to numerical instability. Consider reducing learning rate. !!!")
+                    print("[WARN] Found NaN/Inf in logits. Skipping batch.")
                     continue
-                
+
                 log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
                 loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
 
-            # --- Обратный проход ---
+            # Backward + optimizer step
             if use_amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
+                grad_norm = compute_grad_norm(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 loss.backward()
+                grad_norm = compute_grad_norm(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
 
             total_loss += loss.item()
             n_steps += 1
+            global_step += 1
+
+            # progress bar
             if n_steps % 10 == 0:
                 pbar.set_postfix({"loss": f"{total_loss / n_steps:.4f}"})
-                
+
+            # Logging to W&B / Comet
+            current_lr = optimizer.param_groups[0].get("lr", 0.0)
+            if wandb_run is not None:
+                try:
+                    wandb_run.log({
+                        "train/loss_step": loss.item(),
+                        "train/grad_norm": grad_norm,
+                        "train/lr": current_lr,
+                    }, step=global_step)
+                except Exception as e:
+                    print(f"[WARN] wandb log failed: {e}")
+
+            if comet_exp is not None:
+                try:
+                    comet_exp.log_metric("train.loss_step", loss.item(), step=global_step)
+                    comet_exp.log_metric("train.grad_norm", grad_norm, step=global_step)
+                    comet_exp.log_metric("train.lr", current_lr, step=global_step)
+                except Exception as e:
+                    print(f"[WARN] comet log failed: {e}")
+
+            # Log example prediction every N steps
+            if global_step % args.log_every_steps == 0:
+                # greedy decode 1 sample
+                try:
+                    single_inp = inputs[:1]
+                    single_len = sample_lengths[:1]
+                    decs = greedy_decode_batch(model, single_inp, device, tokenizer, sample_lengths=single_len)
+                    pred_text = decs[0] if len(decs) > 0 else ""
+                except Exception:
+                    pred_text = ""
+
+                ref_text = batch.get("texts", [None])[0] if batch.get("texts") else ""
+                try:
+                    wer = compute_wer(ref_text, pred_text)
+                    cer = compute_cer(ref_text, pred_text)
+                except Exception:
+                    wer, cer = 0.0, 0.0
+
+                # waveform -> numpy 1D
+                wf_np = None
+                try:
+                    wf = inputs[0].detach().cpu().numpy()
+                    if wf.ndim == 3:
+                        # [B,C,T] -> [C,T] for first sample
+                        wf = wf[0]
+                    if wf.ndim == 2:
+                        wf_np = wf.mean(axis=0)
+                    else:
+                        wf_np = wf
+                    max_a = max(1e-8, float(abs(wf_np).max()))
+                    wf_np = wf_np / max_a
+                except Exception:
+                    wf_np = None
+
+                utt_id = batch.get("utt_ids", ["sample"])[0]
+                log_example(wandb_run, comet_exp, utt_id, wf_np, args.sample_rate, ref_text or "", pred_text, wer, cer, step=global_step)
+
         except Exception as e:
-            print(f"Error processing batch: {e}. Skipping.")
+            print(f"[ERROR] Error processing batch: {e}. Skipping.")
             continue
 
-    return total_loss / max(1, n_steps)
+    avg_loss = total_loss / max(1, n_steps)
+    return avg_loss, global_step
+
 
 def validate(model, loader, device, tokenizer, args, max_batches: Optional[int] = None):
     """Валидация модели"""
@@ -227,22 +293,77 @@ def main():
         best_wer = ckpt.get("best_wer", float("inf"))
         print(f"[INFO] Resumed from {args.resume} epoch={start_epoch} best_wer={best_wer:.4f}")
 
-    wandb_run = init_wandb(args, vars(args)) if args.wandb_proj else None
+    wandb_run, comet_exp = init_logging(
+        wandb_project=args.wandb_proj,
+        wandb_name=args.wandb_name,
+        comet_api_key=args.comet_api_key,
+        comet_project=args.comet_project,
+        comet_workspace=args.comet_workspace,
+        comet_name=args.wandb_name,
+        config=vars(args)
+    )
 
+    global_step = 0
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
-        train_loss = run_one_epoch(model, train_loader, optimizer, ctc_loss, device, tokenizer, args, scaler)
+        train_loss, global_step = run_one_epoch(model, train_loader, optimizer, ctc_loss, device, tokenizer, 
+                                                args, scaler, wandb_run=wandb_run, comet_exp=comet_exp, 
+                                                global_step_start=global_step)
+
         epoch_time = time.time() - t0
 
         val_wer, val_cer = float("nan"), float("nan")
         if val_loader:
             val_wer, val_cer, _ = validate(model, val_loader, device, tokenizer, args)
 
+            # Log a couple of validation examples (audio + spec + text) for inspection
+            try:
+                val_batch = next(iter(val_loader))
+                decs = greedy_decode_batch(model, val_batch["inputs"], device, tokenizer, sample_lengths=val_batch["sample_lengths"])
+                n_examples = min(2, len(decs))
+                for i in range(n_examples):
+                    pred = decs[i]
+                    ref = val_batch.get("texts", [""] * len(decs))[i]
+                    utt = val_batch.get("utt_ids", ["val_sample"] * len(decs))[i]
+                    wf = val_batch["inputs"][i].cpu().numpy()
+                    if wf.ndim == 3:
+                        wf = wf[0]
+                    if wf.ndim == 2:
+                        wf_np = wf.mean(axis=0)
+                    else:
+                        wf_np = wf
+                    max_a = max(1e-8, float(abs(wf_np).max()))
+                    wf_np = wf_np / max_a
+                    wer_v = compute_wer(ref, pred)
+                    cer_v = compute_cer(ref, pred)
+                    log_example(wandb_run, comet_exp, f"val_{utt}", wf_np, args.sample_rate, ref, pred, wer_v, cer_v, step=global_step)
+            except Exception as e:
+                print(f"[WARN] val sample logging failed: {e}")
+
         print(f"[Epoch {epoch}/{args.epochs}] train_loss={train_loss:.4f} val_wer={val_wer:.4f} val_cer={val_cer:.4f} time={epoch_time:.1f}s")
         scheduler.step(val_wer if not math.isnan(val_wer) else train_loss)
 
+        # Log epoch-level metrics to W&B/Comet (tied to epoch number)
         if wandb_run:
-            wandb.log({"epoch": epoch, "train_loss": train_loss, "val_wer": val_wer, "val_cer": val_cer, "lr": optimizer.param_groups[0]["lr"]})
+            try:
+                wandb_run.log({
+                    "train_loss_epoch": train_loss,
+                    "val_wer": val_wer,
+                    "val_cer": val_cer,
+                    "epoch": epoch,
+                    "lr": optimizer.param_groups[0]["lr"],
+                }, step=epoch)
+            except Exception as e:
+                print(f"[WARN] wandb epoch log failed: {e}")
+
+        if comet_exp:
+            try:
+                comet_exp.log_metric("train_loss_epoch", train_loss, step=epoch)
+                comet_exp.log_metric("val_wer", val_wer, step=epoch)
+                comet_exp.log_metric("val_cer", val_cer, step=epoch)
+                comet_exp.log_metric("lr", optimizer.param_groups[0]["lr"], step=epoch)
+            except Exception as e:
+                print(f"[WARN] comet epoch log failed: {e}")
 
         is_best = val_wer < best_wer
         if is_best:
@@ -250,6 +371,33 @@ def main():
             best_path = os.path.join(args.save_dir, "best_checkpoint.pth")
             save_checkpoint({"epoch": epoch, "state_dict": model.state_dict(), "best_wer": best_wer}, best_path)
             print(f"[INFO] New best model saved to {best_path} (WER={best_wer:.4f})")
+
+            # Save as W&B artifact / Comet asset if available
+            if wandb_run:
+                try:
+                    wandb_run.summary["best_val_wer"] = best_wer
+                    artifact = wandb_run.Artifact("best-checkpoint", type="model")
+                    artifact.add_file(best_path)
+                    wandb_run.log_artifact(artifact)
+                except Exception as e:
+                    print(f"[WARN] Failed to push checkpoint to wandb: {e}")
+            if comet_exp:
+                try:
+                    comet_exp.log_asset(best_path)
+                except Exception as e:
+                    print(f"[WARN] Failed to push checkpoint to Comet: {e}")
+
+    # Properly finish logging sessions
+    if wandb_run:
+        try:
+            wandb_run.finish()
+        except Exception:
+            pass
+    if comet_exp:
+        try:
+            comet_exp.end()
+        except Exception:
+            pass
 
     print("[INFO] Training finished.")
 
