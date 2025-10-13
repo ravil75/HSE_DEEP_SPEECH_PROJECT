@@ -128,7 +128,7 @@ def build_dataloaders(args, tokenizer):
             n_mels=args.n_mels
         ),
         torchaudio.transforms.AmplitudeToDB()
-    ).to(torch.device(args.device))
+    )
    
 
     train_ds = CustomDirDataset(
