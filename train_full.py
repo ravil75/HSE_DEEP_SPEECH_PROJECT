@@ -5,7 +5,7 @@ import time
 import argparse
 from typing import Optional, Dict, Any, List
 
-import torch
+import torch, torchaudio
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -16,7 +16,7 @@ from tqdm import tqdm
 from src.utils.tokenizer import CharTokenizer
 from src.datasets.custom_dir_dataset import CustomDirDataset
 from src.datasets.collate import collate_fn
-from src.models.deepspeech2_model import DeepSpeech2
+from src.models.deepspeech2_model_1 import ArticleDeepSpeech
 from tools.metrics import batch_metrics, compute_wer, compute_cer
 from src.utils.logging import init_logging, compute_grad_norm, log_example
 from src.augmentations import WaveformAugmentations, SpecAugment
@@ -39,7 +39,7 @@ DEFAULTS = {
     "batch_size": 4,
     "epochs": 5,
     "steps_per_epoch": None,
-    "lr": 3e-4,
+    "lr": 5e-4,
     "rnn_hidden_size": 768,
     "num_rnn_layers": 5,
     "grad_clip": 5.0,
@@ -119,6 +119,17 @@ def build_dataloaders(args, tokenizer):
             time_width=args.time_width,
             p=args.spec_aug_p,
         )
+    
+    melspec_transform = nn.Sequential(
+        torchaudio.transforms.MelSpectrogram(
+            sample_rate=args.sample_rate, 
+            n_fft=400, # можно вынести в args
+            hop_length=args.hop_length, 
+            n_mels=args.n_mels
+        ),
+        torchaudio.transforms.AmplitudeToDB()
+    ).to(torch.device(args.device))
+   
 
     train_ds = CustomDirDataset(
         args.data_root,
@@ -142,10 +153,25 @@ def build_dataloaders(args, tokenizer):
             val_ds = CustomDirDataset(val_root, sample_rate=args.sample_rate,
                                       waveform_augmentations=None
             )
+    
+    collate = lambda b: collate_fn(
+        b, 
+        tokenizer=tokenizer, 
+        hop_length=args.hop_length,
+        melspec_transform=melspec_transform,
+        spec_augmentor=spec_aug
+    )     
 
-    collate = lambda b: collate_fn(b, tokenizer=tokenizer, hop_length=args.hop_length)
+    val_collate = lambda b: collate_fn(
+        b,
+        tokenizer=tokenizer,
+        hop_length=args.hop_length,
+        melspec_transform=melspec_transform,
+        spec_augmentor=None
+    )   
+
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate, num_workers=args.num_workers)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate, num_workers=args.num_workers) if val_ds is not None else None
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=val_collate, num_workers=args.num_workers) 
     return train_loader, val_loader
 
 def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=None):
@@ -166,7 +192,7 @@ def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=N
     return decs
 
 
-def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, scaler=None, wandb_run=None, comet_exp=None, global_step_start=0, beam_decoder: Optional[BeamSearchDecoder]=None):
+def run_one_epoch(model, loader, optimizer, scheduler, ctc_loss, device, tokenizer, args, scaler=None, wandb_run=None, comet_exp=None, global_step_start=0, beam_decoder: Optional[BeamSearchDecoder]=None):
     model.train()
     total_loss = 0.0
     n_steps = 0
@@ -212,6 +238,8 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
                 grad_norm = compute_grad_norm(model)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
+
+            scheduler.step()    
 
             total_loss += loss.item()
             n_steps += 1
@@ -329,7 +357,7 @@ def run_one_epoch(model, loader, optimizer, ctc_loss, device, tokenizer, args, s
 
                 wf_np = None
                 try:
-                    wf = inputs[0].detach().cpu().numpy()
+                    wf = batch["waveforms"][0].detach().cpu().numpy()
                     if wf.ndim == 3:
                         wf = wf[0]
                     if wf.ndim == 2:
@@ -406,19 +434,27 @@ def main():
     train_loader, val_loader = build_dataloaders(args, tokenizer)
     print(f"[INFO] Train size: {len(train_loader.dataset)}, Val size: {len(val_loader.dataset) if val_loader else 0}")
 
-    model = DeepSpeech2(
+    model = ArticleDeepSpeech(
         num_classes=tokenizer.vocab_size,
-        sample_rate=args.sample_rate,
-        n_mels=args.n_mels,
+        n_feats=args.n_mels, # n_feats в новой модели - это n_mels
+        n_cnn_layers=3,      # Как в статье
+        n_rnn_layers=args.num_rnn_layers,
+        rnn_dim=args.rnn_hidden_size,
         hop_length=args.hop_length,
-        rnn_hidden_size=args.rnn_hidden_size,
-        num_rnn_layers=args.num_rnn_layers,
-        use_spec_augment=True
+        dropout=0.1
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2, verbose=True)
-    ctc_loss = nn.CTCLoss(blank=0, zero_infinity=True)
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args.lr,
+        steps_per_epoch=len(train_loader),
+        epochs=args.epochs,
+        anneal_strategy='linear'
+    )
+    
+    ctc_loss = nn.CTCLoss(blank=tokenizer.blank, zero_infinity=True)
+
     scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None
 
     start_epoch, best_wer = 1, float("inf")
@@ -444,7 +480,7 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
         train_loss, global_step = run_one_epoch(
-            model, train_loader, optimizer, ctc_loss, device, tokenizer,
+            model, train_loader, optimizer,scheduler, ctc_loss, device, tokenizer,
             args, scaler, wandb_run=wandb_run, comet_exp=comet_exp,
             global_step_start=global_step, beam_decoder=beam_decoder
         )
@@ -474,7 +510,7 @@ def main():
                     pred = decs[i]
                     ref = val_batch.get("texts", [""] * len(decs))[i]
                     utt = val_batch.get("utt_ids", ["val_sample"] * len(decs))[i]
-                    wf = val_batch["inputs"][i].detach().cpu().numpy()
+                    wf = val_batch["waveforms"][i].detach().cpu().numpy()
 
                     if wf.ndim == 3:
                         wf = wf[0]
@@ -491,7 +527,6 @@ def main():
                 print(f"[WARN] val sample logging failed: {e}")
 
         print(f"[Epoch {epoch}/{args.epochs}] train_loss={train_loss:.4f} val_wer={val_wer:.4f} val_cer={val_cer:.4f} time={epoch_time:.1f}s")
-        scheduler.step(val_wer if not math.isnan(val_wer) else train_loss)
 
         if wandb_run:
             try:
