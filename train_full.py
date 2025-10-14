@@ -36,8 +36,8 @@ DEFAULTS = {
     "sample_rate": 16000,
     "hop_length": 160,
     "n_mels": 80,
-    "batch_size": 4,
-    "epochs": 5,
+    "batch_size": 8,
+    "epochs": 20,
     "steps_per_epoch": None,
     "lr": 5e-4,
     "rnn_hidden_size": 768,
@@ -73,7 +73,7 @@ def parse_args():
     p.add_argument("--comet_api_key", default=None, help="Comet API key (set to enable Comet logging)")
     p.add_argument("--comet_project", default=None, help="Comet project name")
     p.add_argument("--comet_workspace", default=None, help="Comet workspace")
-    p.add_argument("--log_every_steps", type=int, default=50, help="log samples/grad-norm every N steps")
+    p.add_argument("--log_every_steps", type=int, default=100, help="log samples/grad-norm every N steps")
 
     # augmentations
     p.add_argument("--no-augmentations", action="store_true", help="Отключить все аугментации")
@@ -182,14 +182,24 @@ def greedy_decode_batch(model, batch_inputs, device, tokenizer, sample_lengths=N
             inp = batch_inputs.to(device)
             if sample_lengths is not None:
                 sample_lengths = sample_lengths.to(device)
-            logits = model(inp, sample_lengths=sample_lengths)
-           
+            logits = model(inp, sample_lengths=sample_lengths)  # (B, T, C)
+
+            B, T, C = logits.shape
+            if sample_lengths is not None:
+                out_lens = model.get_output_lengths(sample_lengths).cpu().clamp(min=1, max=T).tolist()
+            else:
+                out_lens = [T] * B
+
             preds = torch.argmax(logits, dim=-1).cpu().tolist()
-            decs = [tokenizer.decode(p) for p in preds]
+            decs = []
+            for i, p in enumerate(preds):
+                L = out_lens[i]
+                decs.append(tokenizer.decode(p[:L]))
     finally:
         if was_training:
             model.train()
     return decs
+
 
 
 def run_one_epoch(model, loader, optimizer, scheduler, ctc_loss, device, tokenizer, args, scaler=None, wandb_run=None, comet_exp=None, global_step_start=0, beam_decoder: Optional[BeamSearchDecoder]=None):
@@ -224,6 +234,16 @@ def run_one_epoch(model, loader, optimizer, scheduler, ctc_loss, device, tokeniz
                     continue
 
                 log_probs = nn.functional.log_softmax(logits, dim=-1).transpose(0, 1)
+
+                assert logits.dim() == 3, f"logits dim wrong {logits.shape}"
+                B, T, C = logits.shape
+                input_lengths = model.get_output_lengths(sample_lengths).to(device)
+                if (input_lengths > T).any():
+                    print("[ERROR] some input_lengths > model output T", input_lengths, T)
+
+                if targets.numel() != target_lengths.sum().item():
+                    print("[ERROR] targets length mismatch", targets.shape, target_lengths.sum().item())
+
                 loss = ctc_loss(log_probs, targets, input_lengths, target_lengths)
 
             if use_amp:
@@ -452,7 +472,7 @@ def main():
         epochs=args.epochs,
         anneal_strategy='linear'
     )
-    
+
     ctc_loss = nn.CTCLoss(blank=tokenizer.blank, zero_infinity=True)
 
     scaler = torch.cuda.amp.GradScaler() if device.type == "cuda" else None

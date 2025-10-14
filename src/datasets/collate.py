@@ -75,6 +75,9 @@ def collate_fn(
             enc = tokenizer.encode(txt or "")
             all_targets.extend(enc)
             target_lens.append(len(enc))
+
+        if sum(target_lens) != len(all_targets):
+            raise RuntimeError(f"targets length mismatch: sum(target_lens)={sum(target_lens)} len(all_targets)={len(all_targets)}")    
         
         out["targets"] = torch.tensor(all_targets, dtype=torch.long) if all_targets else torch.empty(0, dtype=torch.long)
         out["target_lengths"] = torch.tensor(target_lens, dtype=torch.long)
