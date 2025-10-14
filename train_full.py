@@ -341,8 +341,26 @@ def run_one_epoch(model, loader, optimizer, scheduler, ctc_loss, device, tokeniz
                             comet_exp.log_metric("train_cer_batch", avg_cer, step=global_step)
                         print(f"[Step {global_step}] Batch metrics - WER: {avg_wer:.4f}, CER: {avg_cer:.4f}")
 
+                    if all_refs and all_decs:
+                        import random
+                        idx = random.randint(0, len(all_refs) - 1)
+                        ref_text = all_refs[idx]
+                        pred_text = all_decs[idx]
+                
+                        try:
+                            example_wer = compute_wer(ref_text, pred_text)
+                            example_cer = compute_cer(ref_text, pred_text)
+                        except Exception:
+                            example_wer, example_cer = 0.0, 0.0
+                
+                        print(f"\n Пример (шаг {global_step}):")
+                        print(f"   Target:  {ref_text}")
+                        print(f"   Prediction: {pred_text}")
+                        print(f"   WER: {example_wer:.4f}, CER: {example_cer:.4f}")
+                        print("-" * 80)
+
                 except Exception as e:
-                    print(f"[WARN] Batch metrics computation failed: {e}")
+                    print(f"[WARN] Batch metrics computation failed: {e}")    
 
                 # single example (корректно берём выходную длину)
                 try:
