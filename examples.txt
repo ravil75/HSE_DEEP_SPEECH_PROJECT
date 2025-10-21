@@ -1,0 +1,40 @@
+
+ID: 1413
+GT   : ben zoof's most ambitious desire was to induce the captain to go with him and end his days in his much loved home and so incessantly were servadac's ears besieged with descriptions of the unparalleled beauties and advantages of this eighteenth arrondissement of paris that he could scarcely hear the name of montmartre without a conscious thrill of aversion
+PRED : benzuf most ambitious desire was to induce the captain to go with him and end his days an as much loved home and so incesantly were servidax ears besieged with descriptions of the unparalo beauties and advantages of this eightent oure undisimale of paris that he could scarcely her the name of mon marthra without a conscious thril of a version
+
+ID: 2017
+GT   : but that is kaffar's knife
+PRED : but that is catfer's klife
+
+ID: 2413
+GT   : but in their selection of a constitution the britannulists have unfortunately allowed themselves but one deliberative assembly and hence have sprung their present difficulties
+PRED : but in their selection of a consitution the brteneules have unfortunaly alow themselves but one deliber asembly and hence has sprong their present dificulties
+
+ID: 176
+GT   : hester could only account for the child's character and even then most vaguely and imperfectly by recalling what she herself had been during that momentous period while pearl was imbibing her soul from the spiritual world and her bodily frame from its material of earth
+PRED : haster could only acount for the child's character and even then most maguly and imperfectly by recaling what she herself had ben duing that momentous period while pearl was inbibing her soul from the spiritual world and her bodily fraime from its material of earth
+
+ID: 765
+GT   : it was the white rabbit returning splendidly dressed with a pair of white kid gloves in one hand and a large fan in the other he came trotting along in a great hurry muttering to himself as he came oh the duchess the duchess
+PRED : it was the white rabit returning splendidly dresed the pair white kid gloves in one hand and a large fan in the other he cam' troting along in a great hury mutering to himself as he came oh the duchest the duches
+
+ID: 1667
+GT   : thank you rachel my cousin rachel my only friend
+PRED : think you rachel my cousin rachel my only friend
+
+ID: 340
+GT   : the only duplicate which existed so far as i knew was that which belonged to my servant bannister a man who has looked after my room for ten years and whose honesty is absolutely above suspicion
+PRED : the only dupeth at which existed so far as i knew was that which belong to my servant banister a man whos loked after my rom for ten years and whoe honesty is absolutely above suspicion
+
+ID: 1902
+GT   : oh well sir what about him
+PRED : oh wel sir what about him
+
+ID: 476
+GT   : the vanderpools were sure of this and the englishman instancing india became quite eloquent missus grey was mystified but hardly dared admit it the general trend of the conversation seemed to be that most individuals needed to be submitted to the sharpest scrutiny before being allowed much education and as for the lower races it was simply criminal to open such useless opportunities to them
+PRED : the vanderpols were sure this and the englishman instancing india became quite eloquent misus gray was mystify but hardly dared admitet the general trand of the conversation semed to be that most individuals neded to be submited to the sharpuscrutiny before being aloud much education and as for the lower races it was simply criminal to open such useles oportunities to them
+
+ID: 1264
+GT   : the earth is not devoid of resemblance to a jail
+PRED : the earth is not devoid of his emblance to a chail
