@@ -37,9 +37,9 @@ python visualize_training.py
 ```
 Построит графики метрик обучения (Loss, WER, CER) и сохранит их в `./checkpoints/`.
 
-**Пример графика:**
+**График обучения предобученной модели:**
 
-![training_plot.jpg](training_plot.png)
+![training_plot.png](checkpoints\training_plot.png)
 
 ---
 
