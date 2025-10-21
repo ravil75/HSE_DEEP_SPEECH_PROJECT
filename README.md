@@ -1,4 +1,4 @@
-'''# DeepSpeech2 PyTorch Pipeline
+# DeepSpeech2 PyTorch Pipeline
 
 Репозиторий для обучения и инференса модели на основе DeepSpeech2 на датасете LibriSpeech.
 Включает продвинутый CTC beam search декодер, полный скрипт инференса, визуализацию метрик и структурированные модули.
@@ -21,7 +21,7 @@ pip install -r requirements.txt
 
 ### 3. Подготовка данных
 
-Скачайте LibriSpeech (`train-clean-100`, `test-clean`) с [официального сайта](https://www.openslr.org/12). Папку разместите по пути, указанному в config.py (обычно `./data/LibriSpeech`).
+Скачайте LibriSpeech (`train-clean-100`, `test-clean`) с [официального сайта](https://www.openslr.org/12). Папку разместите по пути, указанному в config.py (обычно `./data/LibriSpeech`). Либо он установится автоматически при запуске обучения
 
 ### 4. Обучение модели
 
@@ -39,7 +39,7 @@ python visualize_training.py
 
 **Пример графика:**
 
-![training_plot.jpg](training_plot.jpg)
+![training_plot.jpg](training_plot.png)
 
 ---
 
