@@ -39,7 +39,7 @@ python visualize_training.py
 
 **График обучения предобученной модели:**
 
-![training_plot.png](checkpoints\training_plot.png)
+![training_plot.png](checkpoints/training_plot.png)
 
 ---
 
